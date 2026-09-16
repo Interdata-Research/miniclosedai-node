@@ -12,10 +12,13 @@
 # Node.js/npm preinstalled, since those are exactly what install.sh must
 # install for itself (git for the optional latinavoicepod/HF clones; Node.js
 # because `ask`, published to npm as eds-tui, needs >=20 and a fresh Ubuntu
-# box has none at all).
+# box has none at all; git is now needed only for the optional
+# latinavoicepod/HF clones and as the `ask` installer's fallback path).
 #
 # What this DOES validate, for real: git auto-install, Node.js auto-install
-# (NodeSource + apt path), `npm install -g eds-tui` actually succeeding,
+# (NodeSource + apt path), `npm install -g eds-tui@latest` actually
+# succeeding (and NOT silently falling through to the clone+pack fallback),
+# the relay rc-file config being written and surviving a second run,
 # Ollama installing + pulling a real (small) model in CPU mode, the model
 # loading and staying resident, and the bind-to-all-interfaces check running
 # for real (iproute2/`ss` is present). The container also has no systemd
@@ -57,6 +60,10 @@ DOCKER_ARGS=(--rm
     -e "MINICLOSEDAI_NODE_TOKEN=$TOKEN"
     -e "MINICLOSEDAI_NODE_VOICE=0"
     -e "OLLAMA_MODEL=$TEST_MODEL"
+    # Without this, prompt() returns "" (no tty in the container) and the
+    # whole write_ask_config path never executed in CI at all. Never used
+    # for a real request here, so a dummy is safe.
+    -e "MINICLOSEDAI_NODE_ASK_API_KEY=smoke-dummy-key"
 )
 [ -n "${MINICLOSEDAI_HUB_URL:-}" ] && DOCKER_ARGS+=(-e "MINICLOSEDAI_HUB_URL=$MINICLOSEDAI_HUB_URL")
 
@@ -65,7 +72,12 @@ if [ "${DOCKER_SMOKE_TAILSCALE:-0}" = "1" ]; then
     DOCKER_ARGS+=(--cap-add=NET_ADMIN --device=/dev/net/tun)
 fi
 
-BOOTSTRAP='apt-get update -qq && apt-get install -y -qq curl python3 ca-certificates iproute2 && bash /install.sh'
+BOOTSTRAP='apt-get update -qq && apt-get install -y -qq curl python3 ca-certificates iproute2 \
+  && bash /install.sh; echo "=== SMOKE RERUN ==="; bash /install.sh; \
+  echo "=== SMOKE RC COUNT ==="; \
+  for v in EDS_TUI_URL EDS_TUI_TOKEN EDS_TUI_MODEL EDS_TUI_SMALL_MODEL; do \
+    echo "$v $(grep -ch "^export $v=" ~/.bash_aliases ~/.zshrc 2>/dev/null | tr "\n" " ")"; \
+  done'
 
 echo "Running install.sh inside a clean ${IMAGE} container (curl/python3/ss preinstalled, git/Node.js deliberately not)…"
 echo "(full transcript: $LOG)"
@@ -89,9 +101,37 @@ check() {
     fi
 }
 
-check "git auto-installed"          "git installed"
-check "Node.js bootstrap reached"   "Installing Node.js"
-check "ask CLI installed via npm"   "ask CLI ready"
+check "git auto-installed"           "git installed"
+check "Node.js bootstrap reached"    "Installing Node.js"
+check "ask installed from npm"       "Installing the \`ask\` CLI (npm package eds-tui)"
+check "ask CLI verified by running"  "ask CLI ready"
+check "ask relay config written"     "ask configured to reach interdata directly"
+check "EDS_TUI_URL exported"         "export EDS_TUI_URL="
+check "EDS_TUI_SMALL_MODEL exported" "export EDS_TUI_SMALL_MODEL="
+
+# The npm registry path must be the one actually taken. If the fallback
+# string shows up, `ask` still got installed — a PASS for the user — but the
+# thing this test guards (that a bare `npm install -g eds-tui@latest` works
+# on a clean box) has regressed, so say so loudly without failing the run.
+if grep -qF "falling back to the git clone+pack installer" "$LOG"; then
+    printf '! %s\n' "ask came from the git fallback, not npm — investigate before shipping"
+fi
+
+# Idempotency: after two installs there must be exactly one export of each
+# EDS_TUI_* name per rc file, i.e. "<NAME> 1 1". Anything else means the
+# strip list in write_ask_config has drifted from what it writes.
+RC_COUNTS="$(grep -A5 "=== SMOKE RC COUNT ===" "$LOG" | grep -E "^EDS_TUI_[A-Z_]+ " || true)"
+RC_BAD="$(printf '%s\n' "$RC_COUNTS" | grep -vE "^EDS_TUI_[A-Z_]+ 1 1 *$" || true)"
+if [ -z "$RC_COUNTS" ]; then
+    printf '✗ %s\n' "rc export counts missing from the transcript — write_ask_config never ran"
+    FAIL=1
+elif [ -n "$RC_BAD" ]; then
+    printf '✗ %s\n' "EDS_TUI_* exports not exactly once per rc file after a re-run"
+    printf '%s\n' "$RC_BAD" | sed 's/^/    /'
+    FAIL=1
+else
+    printf '✓ %s\n' "rc files idempotent across a re-run (one export of each name per file)"
+fi
 # "model ready" can only be reached if the bind-to-all-interfaces check
 # (real, since iproute2/`ss` is installed) already passed — a failed check
 # calls fail() and halts the script before ever pulling the model, on both
