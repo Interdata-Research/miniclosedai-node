@@ -85,6 +85,7 @@
 #   LATINA_DIR                where to clone latinavoicepod (default: $HOME/latinavoicepod)
 #   MINICLOSEDAI_NODE_ASK_API_KEY  relay API key so `ask` reaches interdata directly (skips the prompt; blank = skip entirely)
 #   MINICLOSEDAI_NODE_ASK_MODEL    model `ask` asks the relay for (default: qwen3.8:latest)
+#   MINICLOSEDAI_NODE_ASK_SMALL_MODEL  model `ask` uses for simpler requests (default: ornith:35b)
 #   MINICLOSEDAI_NODE_HF      1/0 — enable HuggingFace model support (skips the prompt)
 #   MINICLOSEDAI_NODE_HF_TOKEN  HuggingFace access token to save (skips the prompt)
 #   MINICLOSEDAI_NODE_REPO_DIR  where to clone miniclosedai-node itself (default: $HOME/miniclosedai-node)
@@ -172,12 +173,112 @@ ensure_tool() {
         && ok "$apt_pkg installed" \
         || warn "couldn't install $apt_pkg automatically — install it manually, then re-run"
 }
+
+# --- BEGIN shared block: ask-bootstrap -------------------------------------
+# Kept byte-identical between miniclosedai/install.sh and
+# miniclosedai-node/install.sh. Copied rather than fetched on purpose: these
+# are separate repos with no shared library, and pulling this from a fourth
+# URL would add a network round-trip and a trust hop INSIDE a script that is
+# itself already `curl | bash`'d — for ~25 lines of `command -v` checks, and
+# it is exactly the dependency the npm-then-git fallback below exists to
+# route around. test/check-shared-blocks.sh diffs the copies.
+#
+# Requires: say/ok/warn, $OS, $SUDO.
+
+# Install/upgrade Node to >=20 when this box has none or one too old. apt's
+# own `nodejs` package is years out of date on LTS releases (Ubuntu 22.04
+# ships Node 12), hence NodeSource rather than a plain apt-get install.
+ensure_node() {
+    local major=0
+    command -v node >/dev/null 2>&1 && \
+        major="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
+    [ "${major:-0}" -ge 20 ] 2>/dev/null && return 0
+    say "Installing Node.js (the \`ask\` CLI needs >=20; this box has ${major:-none})…"
+    if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+        brew install node
+    elif command -v apt-get >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash - >/dev/null 2>&1 \
+            && $SUDO apt-get install -y -qq nodejs
+    elif command -v dnf >/dev/null 2>&1; then
+        curl -fsSL https://rpm.nodesource.com/setup_22.x | $SUDO bash - >/dev/null 2>&1 \
+            && $SUDO dnf install -y -q nodejs
+    elif command -v apk >/dev/null 2>&1; then
+        $SUDO apk add --quiet nodejs npm
+    fi
+    command -v node >/dev/null 2>&1 && { ok "Node.js $(node -v) installed"; return 0; }
+    warn "couldn't install Node.js automatically — install it manually (https://nodejs.org), then re-run"
+    return 1
+}
+
+ASK_FALLBACK_URL="https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh"
+ASK_OK=0
+
+# Proves the installed `ask` actually runs, not just that a symlink exists.
+# `ask --skills` is the cheapest real proof: it lists installed skills and
+# exits 0 BEFORE any client or network work, so it loads the whole ESM
+# dependency graph (chalk, boxen, marked-terminal, ollama, undici) — exactly
+# the class of breakage a half-finished `npm install -g` leaves behind —
+# without touching the relay or needing a TTY. Bare `ask` would block on
+# stdin; `ask --test` makes real model calls; `ask --version` only exists
+# from 0.6.3 on.
+verify_ask() {
+    local ver
+    ver="$(npm ls -g --depth=0 eds-tui 2>/dev/null | sed -n 's/.*eds-tui@//p' | head -1)"
+    if ! command -v ask >/dev/null 2>&1; then
+        if [ -n "$ver" ]; then
+            # Installed fine, just not on PATH in THIS shell — common with a
+            # fresh npm prefix. A warning, not a failure.
+            ASK_OK=1
+            warn "ask $ver is installed but not on PATH in this shell — it's in \$(npm prefix -g)/bin. Open a new terminal, or add that directory to PATH."
+            return 0
+        fi
+        warn "ask CLI install failed — re-run later: npm install -g eds-tui@latest"
+        return 1
+    fi
+    if ask --skills >/dev/null 2>&1; then
+        ASK_OK=1
+        ok "ask CLI ready${ver:+ ($ver)} — run \`ask\` from any shell"
+    else
+        warn "ask is on PATH but didn't start cleanly — run \`ask --skills\` to see the error"
+        return 1
+    fi
+}
+
+install_ask() {
+    ensure_node || true
+    if ! command -v npm >/dev/null 2>&1; then
+        warn "npm isn't available after the Node.js bootstrap — \`ask\` was skipped. Install Node.js (https://nodejs.org), then: npm install -g eds-tui@latest"
+        return 1
+    fi
+    say "Installing the \`ask\` CLI (npm package eds-tui)…"
+    if npm install -g eds-tui@latest --no-fund --no-audit >/dev/null 2>&1; then
+        :
+    elif [ -n "$SUDO" ]; then
+        # A NodeSource/apt Node puts the global prefix under /usr, owned by
+        # root, so `npm install -g` there fails with EACCES for a normal
+        # user. That is the most common real failure on this path, and the
+        # previous curl|bash version swallowed all output, so it presented
+        # as an unexplained "ask CLI install failed". Retry visibly, so the
+        # real npm error is on screen if this one fails too. Unprivileged is
+        # tried FIRST on purpose: brew/nvm/npm-prefix installs are
+        # user-writable and must not have root-owned files written into them.
+        say "  retrying with sudo (global npm prefix looks root-owned)…"
+        $SUDO npm install -g eds-tui@latest --no-fund --no-audit || true
+    fi
+    if ! command -v ask >/dev/null 2>&1; then
+        warn "npm install didn't produce a usable \`ask\` — falling back to the git clone+pack installer…"
+        command -v git >/dev/null 2>&1 || warn "  (git is missing, so this fallback will likely fail too)"
+        curl -fsSL "$ASK_FALLBACK_URL" 2>/dev/null | bash || true
+    fi
+    verify_ask
+}
+# --- END shared block: ask-bootstrap ---------------------------------------
 # Needed for the optional latinavoicepod / miniclosedai-node (HuggingFace
-# support) clones further down, AND for eds-tui-js's own install.sh below —
-# not guaranteed present on a fresh box (this dev machine always has it,
-# which is why a prior version of this script went uncaught missing it
-# entirely).
-ensure_tool git git git "required to clone latinavoicepod / miniclosedai-node, and to install the ask CLI"
+# support) clones further down, and by the `ask` CLI's FALLBACK installer
+# (the normal npm path doesn't need git) — not guaranteed present on a fresh
+# box (this dev machine always has it, which is why a prior version of this
+# script went uncaught missing it entirely).
+ensure_tool git git git "required to clone latinavoicepod / miniclosedai-node, and by the ask CLI's fallback installer"
 # Ollama's own official installer extracts a .tar.zst archive and hard-fails
 # with "This version requires zstd for extraction" if it's missing — not
 # guaranteed present either (surfaced on arm64 while building this script's
@@ -438,67 +539,25 @@ else
     warn "model doesn't show as loaded in 'ollama ps' — check 'sudo journalctl -u ollama -n 30 --no-pager' if the node responds slowly to its first request"
 fi
 
-# ---------- 3. ask (eds-tui, via eds-tui-js's own installer) ----------
+# ---------- 3. ask (eds-tui, from npm) ----------
 # Installed here, before network registration, so a node still ends up with
 # `ask` even if Tailscale/registration fails further down — this used to
 # run last, so a registration hiccup meant the script never reached it at
 # all, compounding the very problem `ask` would help debug.
 #
-# eds-tui (the `ask` CLI) is a TypeScript/Node package — no Python/pipx
-# toolchain needed on the target machine at install time, which is the
-# entire reason it was rewritten from the original Python/pipx-installed
-# edstui: a `pipx install git+https://...` had to successfully clone the
-# repo on every single target box, and that step alone was the single most
-# common real-world failure across this script's whole install history
-# (TLS/clock issues, a missing git binary, PEP 668 breaking pipx itself, a
-# flat `git clone` failure on at least one real Raspberry Pi).
+# eds-tui (the `ask` CLI) is a TypeScript/Node package, installed straight
+# from npm — no Python/pipx toolchain needed on the target box, which is the
+# entire reason it was rewritten from the original pipx-installed edstui: a
+# `pipx install git+https://...` had to clone the repo successfully on every
+# single target, and that step alone was the most common real-world failure
+# across this script's whole install history (TLS/clock issues, a missing
+# git binary, PEP 668 breaking pipx itself, a flat `git clone` failure on a
+# real Raspberry Pi).
 #
-# NOT installed via a bare `npm install -g eds-tui` (the eventual, simpler
-# intended form) — the npm registry publish for eds-tui is currently stuck
-# on an old version (a publishing-account access issue, unrelated to its
-# code), and separately, `npm install -g git+https://github.com/...` for
-# that repo was directly tested and confirmed unreliable: it can report
-# success while silently producing an incomplete install, with no visible
-# error. Instead this curls eds-tui-js's own install.sh, which clones with
-# a plain `git clone` (not npm's own git-fetch) and installs a locally
-# `npm pack`ed tarball — confirmed reliable in repeated testing where the
-# direct methods above were not. See that script/eds-tui-js's README for
-# the full reasoning; update this block once the npm registry publish is
-# fixed and a bare `npm install -g eds-tui@latest` is reliable again.
-#
-# eds-tui needs Node.js >=20; a fresh/older box may not have that (or any
-# Node at all), so install/upgrade it first via NodeSource's official setup
-# script on Debian/Ubuntu (apt's own default `nodejs` package is often years
-# out of date on LTS releases — e.g. Ubuntu 22.04 ships Node 12), or brew on
-# macOS.
-NODE_MAJOR_OK=0
-if command -v node >/dev/null 2>&1; then
-    NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
-    [ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null && NODE_MAJOR_OK=1
-fi
-if [ "$NODE_MAJOR_OK" != "1" ]; then
-    say "Installing Node.js (for the \`ask\` CLI — eds-tui needs >=20; what's on this box is missing or too old)…"
-    if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
-        brew install node
-    elif command -v apt-get >/dev/null 2>&1; then
-        curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash - >/dev/null 2>&1 \
-            && $SUDO apt-get install -y -qq nodejs
-    fi
-    if command -v node >/dev/null 2>&1; then
-        ok "Node.js $(node -v) installed"
-    else
-        warn "couldn't install Node.js automatically — install it manually (https://nodejs.org), then re-run"
-    fi
-fi
-
-if command -v npm >/dev/null 2>&1; then
-    say "Installing the \`ask\` CLI (eds-tui)…"
-    curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh 2>/dev/null | bash >/dev/null 2>&1 \
-        && ok "ask CLI ready — run \`ask\` from any shell" \
-        || warn "ask CLI install failed (network?) — re-run later: curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh | bash"
-else
-    warn "npm still isn't available after the Node.js bootstrap — \`ask\` was skipped. Install Node.js manually, then: curl -fsSL https://raw.githubusercontent.com/edantonio505/eds-tui-js/main/install.sh | bash"
-fi
+# install_ask handles the Node >=20 bootstrap, the npm install, the EACCES
+# sudo retry, the clone+pack fallback for when the registry is unreachable,
+# and the post-install check — see the shared block near the top.
+install_ask   # sets ASK_OK=1 on success
 
 # `ask` talks to whatever Ollama-shaped host EDS_TUI_URL points at using
 # Ollama's own native wire protocol (not this node's OpenAI-compatible
@@ -509,8 +568,16 @@ fi
 # Pointing `ask` there instead of at this node's own small model is what lets
 # it reach the wider interdata network, e.g. qwen3.8:latest if that's what's
 # registered there — not just whatever this one node happens to be running.
-if command -v ask >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
-    if [ -n "${MINICLOSEDAI_NODE_ASK_API_KEY:-}" ]; then
+# $ASK_OK is set by verify_ask (in the shared block) and is true when `ask`
+# either runs or is at least registered with npm -g. Gating on it rather
+# than `command -v ask` avoids skipping config for a good install that
+# simply isn't on PATH yet; gating on it rather than `command -v npm`
+# avoids writing relay config for an install that outright failed.
+if [ "$ASK_OK" = "1" ]; then
+    # `+x`, not `:-`: the header documents MINICLOSEDAI_NODE_ASK_API_KEY=""
+    # as "skip entirely", which `-n "${VAR:-}"` did not honour — an
+    # explicitly empty value fell through to the prompt instead.
+    if [ -n "${MINICLOSEDAI_NODE_ASK_API_KEY+x}" ]; then
         ASK_API_KEY="$MINICLOSEDAI_NODE_ASK_API_KEY"
     else
         prompt 'Interdata relay API key for `ask` (optional — lets `ask` reach the whole network, not just this node; mint one in miniaicloud admin -> API keys; blank to skip): '
@@ -537,13 +604,18 @@ if command -v ask >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
             # cryptic "sed: 1: ... : i" error, since BSD sed then misreads
             # the script itself as that suffix and the target file as the
             # script. grep -v has no such split and is identical on both.
-            grep -vE '^export (EDS_TUI_URL|EDS_TUI_TOKEN|EDS_TUI_MODEL)=' "$rc_file" \
+            # Keep this name list in sync with miniclosedai/install.sh's own
+            # strip — both products write EDS_TUI_* to the same two rc files,
+            # and a name missing from either list gets duplicated on re-run
+            # or deleted out from under the other installer.
+            grep -vE '^export (EDS_TUI_URL|EDS_TUI_TOKEN|EDS_TUI_MODEL|EDS_TUI_SMALL_MODEL)=' "$rc_file" \
                 > "$rc_file.tmp" || true
             mv "$rc_file.tmp" "$rc_file"
             {
                 printf 'export EDS_TUI_URL=%q\n' "$HUB_URL"
                 printf 'export EDS_TUI_TOKEN=%q\n' "$ASK_API_KEY"
                 printf 'export EDS_TUI_MODEL=%q\n' "${MINICLOSEDAI_NODE_ASK_MODEL:-qwen3.8:latest}"
+                printf 'export EDS_TUI_SMALL_MODEL=%q\n' "${MINICLOSEDAI_NODE_ASK_SMALL_MODEL:-ornith:35b}"
             } >> "$rc_file"
         }
         write_ask_config "$HOME/.bash_aliases"

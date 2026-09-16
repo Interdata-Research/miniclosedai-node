@@ -24,9 +24,13 @@ as much of a small card's VRAM as possible for the model itself.
    context or overhead — set `OLLAMA_MODEL=qwen3.5:9b-q4_K_M` if you'd
    rather trade VRAM headroom for a larger model.)
 3. Installs the **`ask`** CLI ([eds-tui](https://github.com/edantonio505/eds-tui-js),
-   published to npm as `eds-tui`) via npm — installing Node.js first if this
-   box doesn't already have a new enough version (>=20). No git clone or
-   Python/pipx toolchain needed at install time. Done before network
+   published to npm as `eds-tui`) with `npm install -g eds-tui@latest` —
+   installing Node.js first if this box doesn't already have a new enough
+   version (>=20). No Python/pipx toolchain needed at install time. If the
+   registry is unreachable it falls back to eds-tui-js's own installer
+   (`git clone` + `npm pack`), the one case that still needs git. Then it
+   runs `ask --skills` to prove the binary actually starts, rather than
+   assuming a clean `npm` exit means a working install. Done before network
    registration below, so a node still ends up with `ask` even if
    Tailscale/registration fails. Then optionally
    configures `ask` to reach the interdata relay **directly**: miniaicloud
@@ -183,8 +187,10 @@ test/docker-smoke.sh
 Runs `install.sh` inside a genuinely clean `ubuntu:24.04` container (curl/
 python3/`ss` preinstalled, matching a normal Ubuntu box — but deliberately
 no git or Node.js, dependencies that have silently gone missing/been too
-old on real hardware before) and checks that git, Node.js, `ask` (via npm),
-and Ollama all end up installed correctly. It can't validate real GPU inference or the actual
+old on real hardware before) and checks that git, Node.js, `ask` (from npm,
+and verified by actually running it), and Ollama all end up installed
+correctly. It runs the installer twice, so a non-idempotent shell-rc write
+fails the run. It can't validate real GPU inference or the actual
 tailnet path a real relay would use — node registration is expected to
 fail without a real enrollment token, and that's treated as a pass as long
 as everything before it succeeded. Not a replacement for a real-hardware
