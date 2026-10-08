@@ -147,6 +147,17 @@ if command -v tailscale >/dev/null 2>&1; then
         $SUDO systemctl stop tailscaled 2>/dev/null || true
         $SUDO apt-get remove -y -qq tailscale >/dev/null 2>&1 || true
     fi
+    # RunPod install: a userspace tailscaled started by hand, with its static
+    # binaries, state and start script under /workspace (see install.sh).
+    RUNPOD_TS_HOME="/workspace/.miniclosedai-node"
+    if [ -d "$RUNPOD_TS_HOME/tailscale" ]; then
+        pkill -x tailscaled 2>/dev/null || true
+        rm -rf "$RUNPOD_TS_HOME/tailscale" "$RUNPOD_TS_HOME/start-tailscaled.sh"
+        rmdir "$RUNPOD_TS_HOME" 2>/dev/null || true
+        for link in /usr/local/bin/tailscale /usr/local/bin/tailscaled; do
+            [ -L "$link" ] && rm -f "$link"
+        done
+    fi
     hash -r 2>/dev/null || true  # clear bash's PATH cache — a removed binary can otherwise still show as found
     if command -v tailscale >/dev/null 2>&1; then
         warn "tailscale binary still on PATH somewhere — remove it manually if you want it fully gone"

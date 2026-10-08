@@ -63,15 +63,26 @@ as much of a small card's VRAM as possible for the model itself.
      removing it from the tailnet in one action — from miniaicloud's
      Backends page.
    - **RunPod pod** (auto-detected via `$RUNPOD_POD_ID`, which every pod has
-     set): skips Tailscale entirely and registers directly with the pod's
-     own RunPod proxy URL (`https://<pod-id>-<port>.proxy.runpod.net`).
-     RunPod pods have no `/dev/net/tun` access, so Tailscale can't provide
-     real inbound reachability there — the daemon either refuses to start
-     or falls back to userspace-networking mode, which only supports
-     outbound connections. SSH access for these nodes is RunPod's own
-     (dashboard/CLI), not Tailscale SSH — the admin's "Lock" button in
-     miniaicloud still works (it just disables the backend row; there's no
-     Tailscale device to remove for a node that never joined one).
+     set): joins the tailnet too, with `tailscaled` in
+     **userspace-networking** mode (pods have no `/dev/net/tun`). Incoming
+     tailnet connections are accepted by `tailscaled` and handed to the
+     matching port on localhost, which is all the relay needs. This keeps
+     the relay's traffic off RunPod's public proxy, whose Cloudflare front
+     end can block the relay ("Error 1010: Access denied").
+     - Tailscale's static build, its state (the node's tailnet identity and
+       IP) and a `start-tailscaled.sh` script go in
+       `/workspace/.miniclosedai-node/`, the part of a pod that survives a
+       restart. **After a pod restart, run
+       `/workspace/.miniclosedai-node/start-tailscaled.sh`** (e.g. from the
+       pod's start command) and restart Ollama; the node comes back at the
+       same tailnet address.
+     - If any step fails, the installer falls back to the previous
+       behavior: registering the pod's RunPod proxy URL
+       (`https://<pod-id>-<port>.proxy.runpod.net`).
+       `MINICLOSEDAI_NODE_RUNPOD_NETWORK=proxy` forces that.
+     - The installer's own reachability check can be inconclusive from
+       inside the pod; the Backends page's **Test** button is the real
+       check.
 6. *(Not offered on RunPod — see below)* Optionally enables **HuggingFace
    model support**: clones this repo's `manager/` control plane, sets up its
    lightweight venv plus the bare-metal transformers "shim" engine (the one
@@ -121,6 +132,7 @@ already set — useful for a non-interactive/scripted install.
 | `MINICLOSEDAI_NODE_HF_TOKEN` | *(prompts if HF support is enabled)* | HuggingFace access token to save (only needed for gated models) |
 | `MINICLOSEDAI_NODE_REPO_DIR` | `$HOME/miniclosedai-node` | where this repo gets cloned for the model manager + `mcai-node` CLI |
 | `MINICLOSEDAI_NODE_HOME` | `$HOME/.miniclosedai-node` | where `mcai-node` keeps its local state (node id + API key) |
+| `MINICLOSEDAI_NODE_RUNPOD_NETWORK` | `tailscale` | RunPod only: `tailscale` (userspace mode) or `proxy` (the pod's RunPod proxy URL) |
 
 ## `mcai-node` — running HuggingFace models
 

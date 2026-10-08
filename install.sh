@@ -57,11 +57,14 @@
 #        immediately, no manual admin-approval step. The admin can then SSH
 #        straight to it from anywhere, and lock it out (disable + remove
 #        from the tailnet in one action) from miniaicloud's Backends page.
-#      - RunPod pod (detected via $RUNPOD_POD_ID): skips Tailscale entirely
-#        — pods have no /dev/net/tun access, so tailscaled can't do inbound
-#        reachability there — and registers directly with the pod's own
-#        RunPod proxy URL instead. SSH access for these nodes is RunPod's
-#        own (dashboard/CLI), not Tailscale SSH.
+#      - RunPod pod (detected via $RUNPOD_POD_ID): joins the tailnet too, but
+#        with tailscaled in userspace-networking mode (pods have no
+#        /dev/net/tun), installed and kept under /workspace so it survives a
+#        pod restart. Registering the tailnet address keeps the relay's
+#        traffic off RunPod's public proxy, whose Cloudflare front end can
+#        block the relay ("Error 1010: Access denied"). If anything in that
+#        fails, falls back to registering the pod's RunPod proxy URL, the
+#        previous behavior (MINICLOSEDAI_NODE_RUNPOD_NETWORK=proxy forces it).
 #   6. Asks whether to enable HuggingFace model support (skipped on RunPod —
 #      see the section itself for why). If yes: clones miniclosedai-node
 #      (for its manager/ control plane + the mcai-node CLI), sets up the
@@ -90,6 +93,7 @@
 #   MINICLOSEDAI_NODE_HF_TOKEN  HuggingFace access token to save (skips the prompt)
 #   MINICLOSEDAI_NODE_REPO_DIR  where to clone miniclosedai-node itself (default: $HOME/miniclosedai-node)
 #   MINICLOSEDAI_NODE_HOME    where mcai-node keeps its local state (default: $HOME/.miniclosedai-node)
+#   MINICLOSEDAI_NODE_RUNPOD_NETWORK  RunPod only: tailscale (default) or proxy — how the relay reaches the pod
 
 set -euo pipefail
 
@@ -698,38 +702,177 @@ json.dump({"node_id": r["node_id"], "node_api_key": r["node_api_key"],
     chmod 600 "$NODE_STATE_DIR/node.json"
 }
 
-# ---------- 5. Network path: RunPod proxy, or Tailscale ----------
+# ---------- 5. Network path: Tailscale (RunPod: userspace mode), or RunPod proxy ----------
 # RunPod sets RUNPOD_POD_ID inside every pod — reliable, no guessing needed
 # (the same signal latinavoicepod's own /api/connect-info already keys off
-# of). RunPod pods can't use Tailscale for inbound reachability: they have
-# no /dev/net/tun access (blocked since runc v1.2), so `tailscaled` either
-# refuses to start or falls back to userspace-networking mode, which only
-# supports outbound connections — the relay could never connect INTO the
-# pod at a tailnet address. A RunPod node instead registers directly with
-# its own RunPod proxy URL, skipping Tailscale (and /enroll, which only
-# exists to hand out a Tailscale join key) entirely.
-if [ -n "${RUNPOD_POD_ID:-}" ]; then
-    say "RunPod pod detected (${RUNPOD_POD_ID}) — using its proxy URL instead of Tailscale."
-    NODE_BASE_URL="https://${RUNPOD_POD_ID}-${OLLAMA_PORT}.proxy.runpod.net"
+# of). Pods have no /dev/net/tun (blocked since runc v1.2), so tailscaled
+# runs in userspace-networking mode there: incoming tailnet connections are
+# accepted by tailscaled itself and handed to the matching port on
+# localhost, which is all the relay needs (it connects INTO the pod at its
+# tailnet address); outgoing connections from the pod would need tailscaled's
+# SOCKS5 proxy, which nothing here relies on except the self-check below.
+#
+# Why bother instead of just registering the RunPod proxy URL: that URL sits
+# behind RunPod's Cloudflare, which intermittently blocks the relay's server
+# ("Error 1010: Access denied ... browser's signature"), and the relay then
+# hands that HTML page straight back to clients. A tailnet address takes
+# Cloudflare out of the path.
+#
+# Only /workspace survives a pod restart, so the tailscale binaries and
+# tailscaled's state (= the node's tailnet identity and IP, so the relay's
+# registered address stays valid) live there, plus a start script to run
+# after each restart. No /workspace volume: falls back to $NODE_STATE_DIR,
+# which works until the pod is restarted.
+runpod_join_tailnet() {
+    local persist arch ts_dir tgz socks
+    persist="/workspace/.miniclosedai-node"
+    if ! mkdir -p "$persist" 2>/dev/null || [ ! -w "$persist" ]; then
+        persist="$NODE_STATE_DIR"
+        warn "no writable /workspace volume — tailscale state goes in $persist and won't survive a pod restart"
+    fi
+    ts_dir="$persist/tailscale"
+    mkdir -p "$ts_dir/bin" "$ts_dir/state" || return 1
 
-    # Best-effort only, not fatal: a pod curling its own external proxy
-    # hostname can hit hairpin-NAT quirks that don't reflect whether the
-    # RELAY (a genuinely separate host) can reach it — which is what
-    # actually matters. Warn rather than block registration on an
-    # inconclusive local test; verify for real from miniaicloud's admin
-    # "Test" button after registering.
-    say "Best-effort check of ${NODE_BASE_URL} (may be inconclusive from inside the pod itself)…"
-    if curl -sf -m 10 "${NODE_BASE_URL}/api/tags" >/dev/null 2>&1; then
-        ok "proxy URL answered from inside the pod"
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) warn "unsupported CPU architecture for Tailscale's static build: $(uname -m)"; return 1 ;;
+    esac
+
+    if [ ! -x "$ts_dir/bin/tailscaled" ] || [ ! -x "$ts_dir/bin/tailscale" ]; then
+        say "Installing Tailscale (static build, into $ts_dir/bin so it survives pod restarts)…"
+        tgz="$(mktemp)"
+        if ! curl -fsSL -m 120 -o "$tgz" "https://pkgs.tailscale.com/stable/tailscale_latest_${arch}.tgz"; then
+            rm -f "$tgz"; warn "couldn't download Tailscale"; return 1
+        fi
+        if ! tar -xzf "$tgz" -C "$ts_dir/bin" --strip-components=1 --wildcards '*/tailscale' '*/tailscaled'; then
+            rm -f "$tgz"; warn "couldn't unpack Tailscale"; return 1
+        fi
+        rm -f "$tgz"
+        chmod +x "$ts_dir/bin/tailscale" "$ts_dir/bin/tailscaled"
+        ok "Tailscale $("$ts_dir/bin/tailscale" version 2>/dev/null | head -1) installed"
     else
-        warn "no answer from inside the pod (common hairpin-NAT false negative) — verify with the Test button on miniaicloud's Backends page after registering"
+        ok "Tailscale already installed in $ts_dir/bin"
+    fi
+    # The CLI on PATH for this script and for interactive use later.
+    ln -sf "$ts_dir/bin/tailscale" /usr/local/bin/tailscale 2>/dev/null || true
+    ln -sf "$ts_dir/bin/tailscaled" /usr/local/bin/tailscaled 2>/dev/null || true
+
+    socks="localhost:1055"
+    cat > "$persist/start-tailscaled.sh" <<STARTEOF
+#!/usr/bin/env bash
+# Written by miniclosedai-node's install.sh. RunPod has no systemd: run this
+# after every pod restart (e.g. from the pod's start command) to bring the
+# node back onto the tailnet with the same identity and IP.
+set -u
+pgrep -x tailscaled >/dev/null 2>&1 && exit 0
+mkdir -p /var/run/tailscale
+nohup "$ts_dir/bin/tailscaled" \\
+    --tun=userspace-networking \\
+    --state="$ts_dir/state/tailscaled.state" \\
+    --socket=/var/run/tailscale/tailscaled.sock \\
+    --socks5-server=$socks \\
+    >>"$ts_dir/tailscaled.log" 2>&1 &
+STARTEOF
+    chmod +x "$persist/start-tailscaled.sh"
+
+    say "Starting tailscaled in userspace-networking mode…"
+    "$persist/start-tailscaled.sh"
+    local ready=""
+    local st
+    for _ in $(seq 1 20); do
+        # Answers with a BackendState once the daemon is up, logged in or not
+        # (plain `tailscale status` exits non-zero while logged out).
+        st="$("$ts_dir/bin/tailscale" status --json 2>/dev/null || true)"
+        case "$st" in *BackendState*) ready=1; break ;; esac
+        sleep 1
+    done
+    [ -n "$ready" ] || { warn "tailscaled didn't come up — see $ts_dir/tailscaled.log"; return 1; }
+    ok "tailscaled running"
+
+    TS_IP="$("$ts_dir/bin/tailscale" ip -4 2>/dev/null || true)"
+    if [ -n "$TS_IP" ]; then
+        ok "already on the tailnet (state kept from an earlier run): $TS_IP"
+    else
+        say "Requesting a Tailscale join key from ${HUB_URL}…"
+        local enroll_resp authkey
+        if ! enroll_resp="$(hub_post /api/nodes/enroll "{\"token\":\"$TOKEN\"}")"; then
+            warn "the hub refused the Tailscale enrollment"; return 1
+        fi
+        authkey="$(printf '%s' "$enroll_resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tailscale_authkey",""))' 2>/dev/null || true)"
+        [ -n "$authkey" ] || { warn "the hub didn't return a Tailscale auth key"; return 1; }
+
+        say "Joining the tailnet (also enables Tailscale SSH)…"
+        if ! "$ts_dir/bin/tailscale" up --authkey="$authkey" --ssh --hostname="$NODE_NAME" --accept-routes; then
+            warn "tailscale up failed — see $ts_dir/tailscaled.log"; return 1
+        fi
+        for _ in $(seq 1 10); do
+            TS_IP="$("$ts_dir/bin/tailscale" ip -4 2>/dev/null || true)"
+            [ -n "$TS_IP" ] && break
+            sleep 1
+        done
+        [ -n "$TS_IP" ] || { warn "joined the tailnet but couldn't read this node's IP"; return 1; }
+        ok "joined the tailnet as $NODE_NAME: $TS_IP"
     fi
 
-    say "Registering with $HUB_URL as an enabled backend…"
-    REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"$NODE_BASE_URL\"}")"
-    ok "registered: $REGISTER_RESP"
-    save_node_state "$REGISTER_RESP"
-    SSH_NOTE="RunPod node — use RunPod's own SSH access (dashboard/CLI), not Tailscale SSH."
+    # Self-check of the path the relay will use: in userspace mode a plain
+    # curl to our own tailnet IP can't work (no tun device), so go through
+    # tailscaled's SOCKS5 proxy, which makes tailscaled handle the connection
+    # exactly as it handles an incoming one. Not fatal if inconclusive: the
+    # relay's health probe and the Backends page's Test button are the real
+    # judges.
+    say "Checking ${TS_IP}:${OLLAMA_PORT} through tailscaled…"
+    if curl -sf -m 15 --socks5-hostname "$socks" "http://${TS_IP}:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1; then
+        ok "reachable at ${TS_IP}:${OLLAMA_PORT} over the tailnet"
+    else
+        warn "couldn't confirm ${TS_IP}:${OLLAMA_PORT} from inside the pod (can be a false negative in userspace mode) — check it with the Test button on miniaicloud's Backends page; if it fails there, re-run with MINICLOSEDAI_NODE_RUNPOD_NETWORK=proxy"
+    fi
+    RUNPOD_TS_START="$persist/start-tailscaled.sh"
+    return 0
+}
+
+if [ -n "${RUNPOD_POD_ID:-}" ]; then
+    RUNPOD_NETWORK="${MINICLOSEDAI_NODE_RUNPOD_NETWORK:-tailscale}"
+    TS_IP=""
+    RUNPOD_TS_START=""
+    if [ "$RUNPOD_NETWORK" = "tailscale" ]; then
+        say "RunPod pod detected (${RUNPOD_POD_ID}) — joining the tailnet in userspace-networking mode."
+        if ! runpod_join_tailnet; then
+            warn "Tailscale on this pod didn't work out — falling back to the pod's RunPod proxy URL."
+            TS_IP=""
+        fi
+    fi
+
+    if [ -n "$TS_IP" ]; then
+        NODE_BASE_URL="http://${TS_IP}:${OLLAMA_PORT}"
+        say "Registering with $HUB_URL as an enabled backend…"
+        REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"$NODE_BASE_URL\"}")"
+        ok "registered: $REGISTER_RESP"
+        save_node_state "$REGISTER_RESP"
+        SSH_NOTE="Admin can now SSH in with: tailscale ssh $NODE_NAME. After a pod restart, run $RUNPOD_TS_START (and restart Ollama) to bring this node back."
+    else
+        say "Using the pod's RunPod proxy URL."
+        NODE_BASE_URL="https://${RUNPOD_POD_ID}-${OLLAMA_PORT}.proxy.runpod.net"
+
+        # Best-effort only, not fatal: a pod curling its own external proxy
+        # hostname can hit hairpin-NAT quirks that don't reflect whether the
+        # RELAY (a genuinely separate host) can reach it — which is what
+        # actually matters. Warn rather than block registration on an
+        # inconclusive local test; verify for real from miniaicloud's admin
+        # "Test" button after registering.
+        say "Best-effort check of ${NODE_BASE_URL} (may be inconclusive from inside the pod itself)…"
+        if curl -sf -m 10 "${NODE_BASE_URL}/api/tags" >/dev/null 2>&1; then
+            ok "proxy URL answered from inside the pod"
+        else
+            warn "no answer from inside the pod (common hairpin-NAT false negative) — verify with the Test button on miniaicloud's Backends page after registering"
+        fi
+
+        say "Registering with $HUB_URL as an enabled backend…"
+        REGISTER_RESP="$(hub_post /api/nodes/register "{\"token\":\"$TOKEN\",\"name\":\"$NODE_NAME\",\"base_url\":\"$NODE_BASE_URL\"}")"
+        ok "registered: $REGISTER_RESP"
+        save_node_state "$REGISTER_RESP"
+        SSH_NOTE="RunPod node — use RunPod's own SSH access (dashboard/CLI), not Tailscale SSH."
+    fi
 else
     if ! command -v tailscale >/dev/null 2>&1; then
         say "Installing Tailscale…"
